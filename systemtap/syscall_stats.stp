@@ -1,0 +1,106 @@
+global ignored_paths
+probe begin {
+  # ignore file events whose names contain these strings
+  ignored_paths[0]="/dev/net"
+  ignored_paths[1]="/dev/dri"
+  ignored_paths[2]="/dev/input"
+}
+
+probe end {
+  # get rid of all ignored paths
+  delete ignored_paths
+}
+
+function should_skip() {
+  # skip our SystemTap process
+  if (is_myproc()) return 1;
+  return 0;
+}
+
+function should_skip_file(file) {
+  # totally OK and future proof way of checking if *file* contains
+  # one of the *ignored_paths[]* string 
+  return isinstr(file, ignored_paths[0]) || 
+         isinstr(file, ignored_paths[1]) || 
+         isinstr(file, ignored_paths[2]);
+  # strangely the code below fails in spectacular fashion
+  #  foreach([val] in ignored_paths) {
+  #    if (isinstr(file, val)) {
+  #      return 1;
+  #    }
+  #  }
+  #  return 0;
+}
+
+function get_filename(fd) {
+  # Translate *fd* file descriptor to a file name/path in the context
+  # of current task and return it
+  fileobj = task_fd_lookup(task_current(), fd);
+  return fullpath_struct_file(task_current(), fileobj);
+}
+
+function print_syscall_info(hdr, value, value2, file) {
+  # print information about syscall
+
+  # skip certain paths 
+  if (should_skip_file(file)) return 0;
+  printf("%s %d %d %d %d %d %d %d \"%s\" \"%s\" \"%s\"\n", 
+         hdr, gettimeofday_us(), ppid(), pid(), tid(), 
+         ns_pid(), value, value2, file, execname(),
+         cmdline_str()
+  );
+}
+
+probe kernel.function("unix_stream_read_generic").return {
+  # handle the case when data are read from a UDS directly (no *read*)
+  if (should_skip()) next;
+  sock = &@cast(@entry($state->socket), "socket");
+  #ux = &@cast(sock->sk, "unix_sock");
+  # name = &@cast(ux->addr->name, "sockaddr_un");
+  # printf("x = %d\n", name->sun_path[0]);
+  print_syscall_info("usr", $return, sock->sk, 
+                     fullpath_struct_file(task_current(), 
+                                          sock->file));
+}
+
+probe kernel.function("unix_stream_sendmsg").return {
+  # handle the case when data are sent to a UDS directly (no *write*)
+  if (should_skip()) next;
+  print_syscall_info("usw", $return, @entry($sock->sk), 
+                     fullpath_struct_file(task_current(),
+                                          @entry($sock->file)));
+}
+
+probe syscall.open.return {
+  # handle *open* syscall
+  if (should_skip()) next;
+  filename = user_string(@entry($filename));
+  print_syscall_info("o", $return, -1, filename);
+}
+
+probe syscall.read.return {
+  # handle *read* syscall
+  if (should_skip()) next;
+  filename = get_filename(@entry($fd));
+  print_syscall_info("r", $return, @entry($fd), filename);
+}
+
+probe syscall.write.return {
+  # handle *write* syscall
+  if (should_skip()) next;
+  filename = get_filename(@entry($fd));
+  print_syscall_info("w", $return, @entry($fd), filename);
+}
+
+probe syscall.mmap2.return {
+  # handle mmap2 since it provides R/W funcionality for files
+  if (should_skip()) next;
+  fd = __int32(@entry($fd));
+  if(__int32($return) != -1 && fd > 0) {
+    header = "m";
+    if (@entry($prot) & 1) header .= "r";
+    if (@entry($prot) & 2) header .= "w";
+    filename = get_filename(@entry($fd));
+    print_syscall_info(header, $return, @entry($fd), filename);
+  }
+}
